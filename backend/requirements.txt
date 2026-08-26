@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+motor>=3.5.0
+pymongo[srv]>=4.8.0
+google-genai>=1.14.0
+youtube-transcript-api>=1.2.3
+yt-dlp>=2024.8.6
+python-dotenv>=1.0.1
+pydantic>=2.8.0
+dnspython>=2.6.1
