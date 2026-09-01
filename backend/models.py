@@ -12,6 +12,7 @@ class ProcessingStatus(str, Enum):
     PENDING = "pending"
     FETCHING_METADATA = "fetching_metadata"
     FETCHING_TRANSCRIPT = "fetching_transcript"
+    TRANSCRIBING_AUDIO = "transcribing_audio"
     GENERATING_NOTES = "generating_notes"
     GENERATING_FLOWCHART = "generating_flowchart"
     DONE = "done"

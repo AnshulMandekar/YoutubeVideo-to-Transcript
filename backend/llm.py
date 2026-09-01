@@ -12,11 +12,15 @@ from transcript import chunk_transcript
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Initialize the Gemini client
-client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
+
+
+def get_client() -> genai.Client:
+    """Get initialized Gemini client or raise informative error."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable is not set. Please add it to your .env file.")
+    return genai.Client(api_key=api_key)
 
 
 NOTES_PROMPT = """You are an expert educational content analyzer. Given the following YouTube video transcript, generate well-organized, structured lecture notes.
@@ -145,6 +149,7 @@ async def generate_notes(transcript_text: str) -> dict:
 
     Returns parsed JSON dict with notes structure.
     """
+    client = get_client()
     chunks = chunk_transcript(transcript_text)
 
     if len(chunks) == 1:
@@ -212,6 +217,7 @@ async def generate_flowchart(notes: dict) -> str:
     Generate a Mermaid.js flowchart from structured notes.
     Returns Mermaid diagram definition string.
     """
+    client = get_client()
     notes_json = json.dumps(notes, indent=2)
     prompt = FLOWCHART_PROMPT.format(notes_json=notes_json)
 
