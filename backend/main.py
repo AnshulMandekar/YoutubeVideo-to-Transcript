@@ -10,11 +10,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from typing import Optional
 
-from database import connect_db, close_db, create_video, get_video_by_id, get_video_by_video_id, update_video, delete_video, list_videos, get_all_tags
-from models import VideoCreate, ProcessingStatus
+from database import (
+    connect_db,
+    close_db,
+    create_video,
+    get_video_by_id,
+    get_video_by_video_id,
+    update_video,
+    delete_video,
+    list_videos,
+    get_all_tags,
+    add_chat_message,
+    get_chat_history,
+    clear_chat_history,
+)
+from models import VideoCreate, ProcessingStatus, ChatRequest, ChatResponse
 from transcript import extract_video_id, fetch_transcript
 from metadata import fetch_metadata
-from llm import generate_notes, generate_flowchart
+from llm import generate_notes, generate_flowchart, answer_chat_question
+
 
 
 @asynccontextmanager
@@ -247,3 +261,82 @@ async def get_tags_endpoint():
     """Get all unique tags for filtering."""
     tags = await get_all_tags()
     return {"tags": tags}
+
+
+# ── Chat with Notes Endpoints ────────────────────────────────────────────────
+
+
+@app.post("/api/videos/{video_id}/chat", response_model=ChatResponse)
+async def chat_with_notes_endpoint(video_id: str, payload: ChatRequest):
+    """
+    Ask a question about the lecture notes.
+    Generates an answer with Gemini, saves question and answer to DB,
+    and returns the assistant reply along with updated chat history.
+    """
+    video = await get_video_by_id(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    notes = video.get("notes")
+    if not notes and video.get("status") != ProcessingStatus.DONE:
+        raise HTTPException(
+            status_code=400,
+            detail="Lecture notes are not ready yet. Please wait for processing to finish.",
+        )
+
+    user_message = payload.message.strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    # 1. Save user question to DB
+    await add_chat_message(video_id, role="user", content=user_message)
+
+    # 2. Get existing chat history for context
+    chat_history = await get_chat_history(video_id)
+
+    try:
+        # 3. Generate answer from LLM
+        reply = await answer_chat_question(
+            notes=notes,
+            transcript=video.get("transcript"),
+            chat_history=chat_history,
+            user_question=user_message,
+        )
+
+        # 4. Save AI reply to DB
+        await add_chat_message(video_id, role="assistant", content=reply)
+
+        # 5. Return latest full history
+        updated_history = await get_chat_history(video_id)
+        return {"reply": reply, "chat_history": updated_history}
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"Chat generation error for video {video_id}: {tb}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate answer: {str(e)}",
+        )
+
+
+@app.get("/api/videos/{video_id}/chat")
+async def get_chat_history_endpoint(video_id: str):
+    """Get saved chat history for a video."""
+    video = await get_video_by_id(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    history = await get_chat_history(video_id)
+    return {"chat_history": history}
+
+
+@app.delete("/api/videos/{video_id}/chat")
+async def clear_chat_history_endpoint(video_id: str):
+    """Clear chat history for a video."""
+    video = await get_video_by_id(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    await clear_chat_history(video_id)
+    return {"message": "Chat history cleared successfully"}
+

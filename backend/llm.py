@@ -259,3 +259,118 @@ def _fallback_flowchart(notes: dict) -> str:
             lines.append(f'    {node_id} --> {term_id}(\"{safe_term}\")')
 
     return "\n".join(lines)
+
+
+# ── Chat with Notes ──────────────────────────────────────────────────────────
+
+
+CHAT_PROMPT_TEMPLATE = """You are an expert AI educational tutor and study assistant helping a student understand and review lecture notes.
+
+You have access to the structured lecture notes and transcript for this video.
+
+---
+### LECTURE INFORMATION
+**Title:** {title}
+**Summary:** {summary}
+
+### STRUCTURED NOTES & SECTIONS:
+{sections_text}
+
+### KEY TAKEAWAYS:
+{takeaways_text}
+
+### TRANSCRIPT EXCERPT:
+{transcript_text}
+---
+
+### RECENT CHAT HISTORY:
+{history_text}
+
+### USER'S QUESTION:
+{user_question}
+
+---
+### INSTRUCTIONS:
+1. Answer the student's question accurately, thoroughly, and clearly using the lecture notes and transcript.
+2. If the user asks for summaries, quizzes, explanations, analogies, or practical examples, tailor your explanation to be engaging and educational.
+3. If referencing specific concepts that appear with timestamps in the notes, cite the section or timestamp (e.g., "[04:15]") to help the student find it in the video.
+4. Format your answer nicely using Markdown (bullet points, bold text for key terms, code blocks if programming-related, math notation if applicable).
+5. If the question asks about something not mentioned in the lecture or transcript, acknowledge what the lecture covers and provide helpful educational context if relevant.
+6. Keep your tone encouraging, clear, and focused.
+"""
+
+
+async def answer_chat_question(
+    notes: Optional[dict] = None,
+    transcript: Optional[str] = None,
+    chat_history: Optional[list[dict]] = None,
+    user_question: str = "",
+) -> str:
+    """
+    Answer a user question in the context of lecture notes and transcript.
+    Uses conversation history for multi-turn dialogue.
+    """
+    client = get_client()
+
+    notes = notes or {}
+    title = notes.get("title", "Lecture")
+    summary = notes.get("summary", "No summary provided.")
+
+    # Format sections
+    sections_list = notes.get("sections", [])
+    if sections_list:
+        sec_lines = []
+        for s in sections_list:
+            heading = s.get("heading", "")
+            ts = f" (at {s['timestamp']})" if s.get("timestamp") else ""
+            sec_lines.append(f"• **{heading}**{ts}")
+            for p in s.get("subpoints", []):
+                sec_lines.append(f"  - {p}")
+            if s.get("key_terms"):
+                sec_lines.append(f"  - Key Terms: {', '.join(s['key_terms'])}")
+        sections_text = "\n".join(sec_lines)
+    else:
+        sections_text = "No detailed sections available."
+
+    # Format takeaways
+    takeaways = notes.get("key_takeaways", [])
+    if takeaways:
+        takeaways_text = "\n".join([f"- {t}" for t in takeaways])
+    else:
+        takeaways_text = "No key takeaways listed."
+
+    # Truncate transcript if very long to prevent token overflow
+    if transcript:
+        # Keep up to 30,000 characters
+        transcript_text = transcript[:30000]
+        if len(transcript) > 30000:
+            transcript_text += "\n... [transcript truncated] ..."
+    else:
+        transcript_text = "Transcript not available."
+
+    # Format history (last 10 messages)
+    history_lines = []
+    if chat_history:
+        for msg in chat_history[-10:]:
+            role = "Student" if msg.get("role") == "user" else "AI Tutor"
+            content = msg.get("content", "")
+            history_lines.append(f"{role}: {content}")
+    history_text = "\n".join(history_lines) if history_lines else "None (New conversation)"
+
+    prompt = CHAT_PROMPT_TEMPLATE.format(
+        title=title,
+        summary=summary,
+        sections_text=sections_text,
+        takeaways_text=takeaways_text,
+        transcript_text=transcript_text,
+        history_text=history_text,
+        user_question=user_question,
+    )
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+    )
+
+    return response.text.strip()
+

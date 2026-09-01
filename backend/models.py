@@ -26,6 +26,25 @@ class VideoCreate(BaseModel):
     url: str = Field(..., description="YouTube video URL")
 
 
+# ── Chat Models ──────────────────────────────────────────────────────────────
+
+
+class ChatMessage(BaseModel):
+    id: Optional[str] = None
+    role: str = Field(..., description="'user' or 'assistant'")
+    content: str
+    created_at: Optional[datetime] = None
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000, description="Question about lecture notes")
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    chat_history: list[ChatMessage] = []
+
+
 # ── Note Structure Models ────────────────────────────────────────────────────
 
 
@@ -62,7 +81,7 @@ class VideoSummary(BaseModel):
 
 
 class VideoDetail(BaseModel):
-    """Full video object with notes and flowchart."""
+    """Full video object with notes, flowchart, and chat history."""
     id: str
     url: str
     video_id: str
@@ -75,6 +94,8 @@ class VideoDetail(BaseModel):
     notes: Optional[StructuredNotes] = None
     flowchart: Optional[str] = None
     transcript: Optional[str] = None
+    chat_history: list[ChatMessage] = []
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+

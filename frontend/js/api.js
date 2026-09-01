@@ -92,9 +92,36 @@ const api = {
     },
 
     /**
+     * Send a chat question to the AI tutor about the video notes.
+     */
+    async sendChatMessage(videoId, message) {
+        return this.request(`/videos/${videoId}/chat`, {
+            method: 'POST',
+            body: JSON.stringify({ message }),
+        });
+    },
+
+    /**
+     * Get saved chat history for a video.
+     */
+    async getChatHistory(videoId) {
+        return this.request(`/videos/${videoId}/chat`);
+    },
+
+    /**
+     * Clear all chat history for a video.
+     */
+    async clearChatHistory(videoId) {
+        return this.request(`/videos/${videoId}/chat`, {
+            method: 'DELETE',
+        });
+    },
+
+    /**
      * Health check.
      */
     async healthCheck() {
         return this.request('/health');
     },
 };
+

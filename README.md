@@ -44,6 +44,7 @@ LectureNotes automates the entire synthesis workflow:
 - ⏱️ **Timestamp-Synced Video Navigation**: Jump straight to relevant video segments by clicking timestamp badges within the notes.
 - 🔍 **Search & Tag Filtering**: Real-time searching across video titles, channel names, and auto-generated topic tags.
 - 📥 **Export to Markdown & PDF**: Download formatted notes with embedded Mermaid diagrams as `.md` files or print directly to PDF.
+- 💬 **Interactive AI Study Tutor & Chat**: Ask questions, request concept quizzes, and get tailored explanations based on lecture notes and transcript context. All conversation history is automatically saved to MongoDB for continuous review.
 - 🎨 **Modern Glassmorphic Dark UI**: Clean, responsive, accessible interface with subtle micro-animations and ambient glowing backdrops.
 
 ---
@@ -164,7 +165,11 @@ Visit [http://localhost:5500](http://localhost:5500) in your browser.
 | `GET` | `/api/videos/{video_id}` | Retrieve specific video with notes and flowchart |
 | `DELETE`| `/api/videos/{video_id}` | Delete a video and its stored notes |
 | `GET` | `/api/videos/{video_id}/export/markdown` | Download notes formatted as a `.md` file |
+| `POST` | `/api/videos/{video_id}/chat` | Ask a question to the AI tutor with lecture notes in context (saved to DB) |
+| `GET` | `/api/videos/{video_id}/chat` | Retrieve persistent chat history for a video |
+| `DELETE`| `/api/videos/{video_id}/chat` | Clear saved chat history for a video |
 | `GET` | `/api/tags` | Retrieve all unique tags for categorization |
+
 
 ---
 

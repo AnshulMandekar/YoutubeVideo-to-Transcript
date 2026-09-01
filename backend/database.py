@@ -56,6 +56,8 @@ def _serialize_doc(doc: dict) -> dict:
     if doc and "_id" in doc:
         doc["id"] = str(doc["_id"])
         del doc["_id"]
+    if doc and "chat_history" not in doc:
+        doc["chat_history"] = []
     return doc
 
 
@@ -66,6 +68,8 @@ async def create_video(video_data: dict) -> dict:
     """Insert a new video document. Returns the created document."""
     video_data["created_at"] = datetime.now(timezone.utc)
     video_data["updated_at"] = datetime.now(timezone.utc)
+    if "chat_history" not in video_data:
+        video_data["chat_history"] = []
     result = await db.videos.insert_one(video_data)
     video_data["_id"] = result.inserted_id
     return _serialize_doc(video_data)
@@ -118,7 +122,7 @@ async def list_videos(
         filter_doc["tags"] = tag
 
     cursor = (
-        db.videos.find(filter_doc, {"notes": 0, "flowchart": 0, "transcript": 0})
+        db.videos.find(filter_doc, {"notes": 0, "flowchart": 0, "transcript": 0, "chat_history": 0})
         .sort("created_at", -1)
         .skip(skip)
         .limit(limit)
@@ -134,3 +138,50 @@ async def get_all_tags() -> list[str]:
     """Get all unique tags across all videos."""
     tags = await db.videos.distinct("tags")
     return sorted([t for t in tags if t])
+
+
+# ── Chat CRUD Operations ─────────────────────────────────────────────────────
+
+
+async def add_chat_message(video_id: str, role: str, content: str) -> dict:
+    """Append a chat message to the video's chat_history array in MongoDB."""
+    message = {
+        "id": str(ObjectId()),
+        "role": role,
+        "content": content,
+        "created_at": datetime.now(timezone.utc),
+    }
+    await db.videos.update_one(
+        {"_id": ObjectId(video_id)},
+        {
+            "$push": {"chat_history": message},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    return message
+
+
+async def get_chat_history(video_id: str) -> list[dict]:
+    """Retrieve the chat history array for a video."""
+    doc = await db.videos.find_one(
+        {"_id": ObjectId(video_id)},
+        {"chat_history": 1},
+    )
+    if not doc:
+        return []
+    return doc.get("chat_history", [])
+
+
+async def clear_chat_history(video_id: str) -> bool:
+    """Clear all chat messages for a video."""
+    result = await db.videos.update_one(
+        {"_id": ObjectId(video_id)},
+        {
+            "$set": {
+                "chat_history": [],
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.matched_count > 0
+
