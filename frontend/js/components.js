@@ -64,6 +64,7 @@ function renderStatusBadge(status) {
         pending: 'Pending',
         fetching_metadata: 'Fetching…',
         fetching_transcript: 'Transcript…',
+        transcribing_audio: 'Transcribing…',
         generating_notes: 'Generating…',
         generating_flowchart: 'Flowchart…',
         done: 'Ready',

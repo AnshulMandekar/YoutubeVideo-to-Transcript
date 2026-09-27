@@ -2,6 +2,7 @@
 FastAPI application — main entry point with all API routes.
 """
 import os
+import asyncio
 import traceback
 from contextlib import asynccontextmanager
 
@@ -128,11 +129,28 @@ async def create_video_endpoint(payload: VideoCreate):
             "duration_seconds": meta.get("duration_seconds"),
         })
 
-        # 5. Fetch transcript
+        # 5. Fetch an English transcript (captions, or Gemini transcription when there are none).
+        # Runs in a worker thread: transcription can take minutes and must not block the server.
         await update_video(doc_id, {"status": ProcessingStatus.FETCHING_TRANSCRIPT})
-        transcript_data = fetch_transcript(video_id)
+        loop = asyncio.get_running_loop()
+
+        def mark_transcribing():
+            asyncio.run_coroutine_threadsafe(
+                update_video(doc_id, {"status": ProcessingStatus.TRANSCRIBING_AUDIO}), loop
+            ).result(timeout=30)
+
+        transcript_data = await asyncio.to_thread(
+            fetch_transcript,
+            video_id,
+            duration_seconds=meta.get("duration_seconds"),
+            on_fallback=mark_transcribing,
+        )
         transcript_text = transcript_data["text"]
-        await update_video(doc_id, {"transcript": transcript_text})
+        await update_video(doc_id, {
+            "transcript": transcript_text,
+            "transcript_source": transcript_data["source"],
+            "transcript_language": transcript_data.get("language"),
+        })
 
         # 6. Generate notes via LLM
         await update_video(doc_id, {"status": ProcessingStatus.GENERATING_NOTES})
