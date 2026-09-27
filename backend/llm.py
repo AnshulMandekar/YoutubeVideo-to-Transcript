@@ -4,6 +4,7 @@ Gemini LLM integration for generating structured lecture notes and Mermaid flowc
 import os
 import json
 import re
+from typing import Optional
 
 from google import genai
 from dotenv import load_dotenv
@@ -57,6 +58,7 @@ NOTES_PROMPT = """You are an expert educational content analyzer. Given the foll
 6. If the content does NOT appear to be educational/lecture content, still generate notes but set the first tag as "Non-Educational" and note this in the summary
 7. Timestamps should reference the approximate video time where each section begins
 8. Be thorough — capture the substance of the lecture, not just surface-level summaries
+9. Write everything in English. If any part of the transcript is in another language (e.g. Hindi or Hinglish), translate it
 
 **TRANSCRIPT:**
 {transcript}

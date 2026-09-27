@@ -835,6 +835,7 @@ img {
 .status-badge-processing,
 .status-badge-fetching_metadata,
 .status-badge-fetching_transcript,
+.status-badge-transcribing_audio,
 .status-badge-generating_notes,
 .status-badge-generating_flowchart {
     background: rgba(99, 102, 241, 0.15);

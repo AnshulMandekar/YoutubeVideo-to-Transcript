@@ -1,21 +1,72 @@
 """
-YouTube transcript extraction with multi-level fallback:
-1. YouTube Transcript API (manual and auto-generated captions in any language with translation).
-2. Audio-to-Transcript Fallback (downloads audio via yt-dlp and transcribes via Gemini 2.5 Flash).
+YouTube transcript extraction. Every video ends up with a timestamped ENGLISH transcript:
+
+1. YouTube captions (manual or auto-generated, in any language). Captions that are not in
+   English (e.g. Hindi / Hinglish) are translated to English with Gemini.
+2. No captions -> Gemini watches the public YouTube URL directly and transcribes it into
+   English. Nothing is downloaded, so this also works on cloud hosts where YouTube blocks
+   downloads.
+3. Last resort -> download the audio with yt-dlp, upload it to Gemini and transcribe it
+   into English.
 """
 import os
 import re
-import json
+import math
+import time
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Callable
 
 from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
 from google import genai
+from google.genai import types, errors
 from dotenv import load_dotenv
 
 load_dotenv()
+
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Long videos are transcribed in windows so timestamps stay accurate and each response stays
+# far below the model's output-token limit.
+YOUTUBE_WINDOW_SECONDS = 15 * 60
+# The whole audio file is sent with every window request, so use fewer, larger windows.
+AUDIO_WINDOW_SECONDS = 30 * 60
+# Frames sampled per second when Gemini watches a video. Speech is what matters; a few
+# frames still let it read slides and board work to spell technical terms correctly.
+YOUTUBE_FPS = 0.2
+
+# Auto-generated captions arrive as ~5 second fragments. Grouping them into blocks before
+# translating gives the model whole sentences to work with.
+TRANSLATION_BLOCK_SECONDS = 20
+TRANSLATION_CHUNK_CHARS = 10000
+
+
+TRANSCRIBE_PROMPT = """You are a professional transcriber and translator. {scope}
+
+Write the transcript in ENGLISH:
+- If the speaker uses Hindi, Hinglish or any other language, translate what is said into clear, natural English. Keep technical terms, names, formulas and code exactly as spoken.
+- Do not summarize or skip anything, and do not add anything that is not said.
+- Ignore music and background noise. If nobody speaks, output only the LANGUAGE line.
+
+Output format: the first line names the language that is spoken, then one line per sentence or short phrase, each starting with the time it is spoken, measured from the start of the full video:
+LANGUAGE: <language name, e.g. Hindi>
+[MM:SS] English text
+[MM:SS] English text
+Use [H:MM:SS] after the first hour. Output nothing else."""
+
+
+TRANSLATE_PROMPT = """Translate this YouTube lecture transcript into clear, natural English. It was captioned automatically in {language}, so it may be Hinglish (Hindi mixed with English, often with English words written in Devanagari) and may contain speech-recognition errors.
+
+Rules:
+- Keep every line and its [timestamp] exactly as given; translate only the text after the timestamp.
+- Translate faithfully. Do not summarize, skip or add content. Fix obvious recognition errors from context.
+- Keep technical terms, names, formulas and code in their standard English form.
+- Output only the translated lines.
+
+TRANSCRIPT:
+{transcript}"""
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -74,262 +125,407 @@ def parse_timestamp_to_seconds(ts_str: str) -> float:
     return 0.0
 
 
-def _fetch_from_youtube_api(video_id: str) -> dict:
-    """
-    Fetch transcript using YouTube Transcript API.
-    Supports manual captions, auto-generated captions, and translations.
-    """
-    ytt_api = YouTubeTranscriptApi()
-    transcript_list = ytt_api.list(video_id)
+# ── Shared helpers ───────────────────────────────────────────────────────────
 
-    preferred_languages = ["en", "en-US", "en-GB", "en-CA", "en-IN", "en-AU"]
 
-    selected_transcript = None
+_TS = r"\d{1,2}(?::\d{2}){1,2}(?:\.\d+)?"
+# "[12:34] text", "12:34 - text" or "[12:34 - 12:40] text"
+_LINE_RE = re.compile(rf"^\[?\s*({_TS})\s*(?:[-–]\s*{_TS}\s*)?\]?\s*[-–:]?\s*(.*)$")
+_LANGUAGE_RE = re.compile(r"^[*_\s]*language[*_\s]*:\s*(.+)$", re.IGNORECASE)
 
-    # 1. Try manual transcript in preferred languages
-    try:
-        selected_transcript = transcript_list.find_manually_created_transcript(preferred_languages)
-    except Exception:
-        pass
 
-    # 2. Try auto-generated transcript in preferred languages
-    if not selected_transcript:
-        try:
-            selected_transcript = transcript_list.find_generated_transcript(preferred_languages)
-        except Exception:
-            pass
+def _is_english(language_code: str) -> bool:
+    return language_code.split("-")[0].lower() == "en"
 
-    # 3. Try any transcript translated to English if available
-    if not selected_transcript:
-        for t in transcript_list:
-            if t.is_translatable:
-                try:
-                    selected_transcript = t.translate("en")
-                    break
-                except Exception:
-                    continue
 
-    # 4. Fallback to any available transcript
-    if not selected_transcript:
-        try:
-            selected_transcript = next(iter(transcript_list))
-        except StopIteration:
-            raise ValueError("No transcript streams available via YouTube API")
-
-    raw_entries = selected_transcript.fetch()
+def _parse_timestamped_lines(raw: str) -> tuple[Optional[str], list[dict]]:
+    """Parse Gemini output ('LANGUAGE: x' then '[MM:SS] text' lines) into (language, segments)."""
+    language = None
     segments = []
-    for entry in raw_entries:
-        # Support dict format or object with attributes
-        if isinstance(entry, dict):
-            text = entry.get("text", "")
-            start = float(entry.get("start", 0))
-            duration = float(entry.get("duration", 0))
-        else:
-            text = getattr(entry, "text", "")
-            start = float(getattr(entry, "start", 0))
-            duration = float(getattr(entry, "duration", 0))
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        lang_match = _LANGUAGE_RE.match(line)
+        if lang_match and not segments:
+            language = lang_match.group(1).strip(" *_.") or None
+            continue
+        match = _LINE_RE.match(line)
+        if match:
+            text = match.group(2).strip()
+            if text:
+                segments.append({
+                    "text": text,
+                    "start": parse_timestamp_to_seconds(match.group(1)),
+                    "duration": 0.0,
+                })
+        elif segments:
+            # Line without a timestamp: the model wrapped a long sentence.
+            segments[-1]["text"] += " " + line
+    return language, segments
 
-        if text:
-            segments.append({
-                "text": text,
-                "start": start,
-                "duration": duration,
-            })
 
-    if not segments:
-        raise ValueError("YouTube transcript is empty")
+def _build_result(segments: list[dict], source: str, language: Optional[str]) -> dict:
+    """Sort segments, fill in missing durations and build the transcript result dict."""
+    segments = sorted(segments, key=lambda s: s["start"])
+    for current, following in zip(segments, segments[1:]):
+        if not current["duration"]:
+            current["duration"] = max(0.0, following["start"] - current["start"])
+    if not segments[-1]["duration"]:
+        segments[-1]["duration"] = 5.0
 
-    full_text = ""
-    for seg in segments:
-        ts = format_timestamp(seg["start"])
-        full_text += f"[{ts}] {seg['text']}\n"
-
+    full_text = "".join(f"[{format_timestamp(s['start'])}] {s['text']}\n" for s in segments)
     last_seg = segments[-1]
-    duration_seconds = last_seg["start"] + last_seg["duration"]
 
     return {
         "text": full_text,
         "segments": segments,
-        "duration_seconds": duration_seconds,
-        "source": "youtube_captions",
+        "duration_seconds": last_seg["start"] + last_seg["duration"],
+        "source": source,
+        "language": language,
     }
 
 
-def transcribe_audio_fallback(video_id: str) -> dict:
-    """
-    Download audio track using yt-dlp and transcribe using Gemini 2.5 Flash.
-    Used when a YouTube video has no captions or transcripts disabled.
-    """
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
+def _gemini_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
         raise ValueError(
-            "Video has no captions and GEMINI_API_KEY is not configured for audio transcription fallback."
+            "GEMINI_API_KEY is not configured, so this video cannot be transcribed or translated."
         )
+    return genai.Client(
+        api_key=api_key,
+        # Retries rate limits (429) and transient server errors with exponential backoff.
+        http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=4)),
+    )
 
-    client = genai.Client(api_key=gemini_api_key)
+
+def _generate(client: genai.Client, contents, media_resolution=None) -> str:
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            # Transcription and translation don't benefit from thinking; skip it for speed.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            media_resolution=media_resolution,
+        ),
+    )
+    return response.text or ""
+
+
+def _plan_windows(duration_seconds: Optional[float], window_seconds: int) -> list[tuple[float, Optional[float]]]:
+    """Split a video into roughly equal (start, end) windows. end=None means 'the whole video'."""
+    if not duration_seconds:
+        return [(0.0, None)]
+    count = max(1, round(duration_seconds / window_seconds))
+    if count == 1:
+        return [(0.0, None)]
+    size = duration_seconds / count
+    return [(i * size, (i + 1) * size) for i in range(count)]
+
+
+def _transcribe_windows(
+    windows: list[tuple[float, Optional[float]]],
+    request: Callable[[float, Optional[float]], str],
+    max_workers: int,
+) -> tuple[Optional[str], list[dict]]:
+    """
+    Run one Gemini transcription request per window and stitch the results together.
+    A failed window is skipped; if every window fails, the first error is raised.
+    """
+
+    def run(window):
+        start, end = window
+        try:
+            language, segments = _parse_timestamped_lines(request(start, end))
+        except Exception as e:
+            print(f"Transcription failed for window starting at {format_timestamp(start)}: {e}")
+            return None, [], e
+        if end is None:
+            return language, segments, None
+
+        # Clips sometimes come back timed from the start of the clip, not the full video.
+        if start > 0 and segments and segments[0]["start"] < start - 30 and segments[-1]["start"] <= end - start + 30:
+            for seg in segments:
+                seg["start"] += start
+        # Drop anything outside the window (the audio fallback always sees the full file).
+        in_window = [s for s in segments if start - 15 <= s["start"] <= end + 15]
+        return language, in_window or segments, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(run, windows))
+
+    languages = [language for language, _, _ in results if language]
+    segments = [seg for _, window_segments, _ in results for seg in window_segments]
+    window_errors = [error for _, _, error in results if error]
+    if not segments and window_errors:
+        raise window_errors[0]
+    return (languages[0] if languages else None), segments
+
+
+# ── 1. YouTube captions ──────────────────────────────────────────────────────
+
+
+def _fetch_youtube_captions(video_id: str) -> tuple[list[dict], str, str]:
+    """
+    Fetch the best caption track in any language.
+    Returns (segments, language_code, language_name).
+    """
+    tracks = list(YouTubeTranscriptApi().list(video_id))
+    if not tracks:
+        raise ValueError("Video has no caption tracks")
+
+    # English first, then any other language (translated later); manual beats auto-generated.
+    tracks.sort(key=lambda t: (not _is_english(t.language_code), t.is_generated))
+    track = tracks[0]
+
+    segments = []
+    for entry in track.fetch():
+        text = entry.text.replace("\n", " ").strip()
+        if text:
+            segments.append({"text": text, "start": float(entry.start), "duration": float(entry.duration)})
+
+    if not segments:
+        raise ValueError("YouTube transcript is empty")
+
+    language_name = track.language.replace("(auto-generated)", "").strip()
+    return segments, track.language_code, language_name
+
+
+def _translate_segments(segments: list[dict], language: str) -> tuple[list[dict], bool]:
+    """
+    Translate caption segments to English, keeping timestamps.
+    Returns (segments, translated). Parts that fail to translate keep their original text.
+    """
+    client = _gemini_client()
+
+    blocks = []
+    for seg in segments:
+        if blocks and seg["start"] - blocks[-1]["start"] < TRANSLATION_BLOCK_SECONDS:
+            blocks[-1]["text"] += " " + seg["text"]
+        else:
+            blocks.append({"text": seg["text"], "start": seg["start"], "duration": 0.0})
+
+    chunks, current, size = [], [], 0
+    for block in blocks:
+        if current and size + len(block["text"]) > TRANSLATION_CHUNK_CHARS:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(block)
+        size += len(block["text"])
+    if current:
+        chunks.append(current)
+
+    def translate(chunk):
+        lines = "".join(f"[{format_timestamp(b['start'])}] {b['text']}\n" for b in chunk)
+        try:
+            raw = _generate(client, TRANSLATE_PROMPT.format(language=language, transcript=lines))
+            _, translated = _parse_timestamped_lines(raw)
+        except Exception as e:
+            print(f"Translation failed for chunk starting at {format_timestamp(chunk[0]['start'])}: {e}")
+            translated = []
+        return translated or None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(translate, chunks))
+
+    translated_any = any(results)
+    merged = [seg for chunk, result in zip(chunks, results) for seg in (result or chunk)]
+    return merged, translated_any
+
+
+# ── 2. Gemini watches the YouTube video ──────────────────────────────────────
+
+
+def _transcribe_from_youtube_url(client: genai.Client, video_id: str, duration_seconds: Optional[float]) -> dict:
+    """Let Gemini fetch the public YouTube video itself and transcribe it into English."""
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    def request(start: float, end: Optional[float]) -> str:
+        if end is None:
+            scope = "Transcribe all of the speech in this video."
+            clip = {}
+        else:
+            scope = (
+                f"This is a clip from {format_timestamp(start)} to {format_timestamp(end)} of a longer "
+                f"video. Transcribe all of the speech in the clip."
+            )
+            clip = {"start_offset": f"{int(start)}s", "end_offset": f"{math.ceil(end)}s"}
+
+        def ask(fps: Optional[float]) -> str:
+            metadata = {**clip, "fps": fps} if fps else clip
+            part = types.Part(
+                file_data=types.FileData(file_uri=video_url),
+                video_metadata=types.VideoMetadata(**metadata) if metadata else None,
+            )
+            return _generate(
+                client,
+                [part, TRANSCRIBE_PROMPT.format(scope=scope)],
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+            )
+
+        try:
+            return ask(YOUTUBE_FPS)
+        except errors.ClientError as e:
+            if e.code != 400:
+                raise
+            # Retry with the default frame rate in case custom sampling is rejected.
+            return ask(None)
+
+    windows = _plan_windows(duration_seconds, YOUTUBE_WINDOW_SECONDS)
+    language, segments = _transcribe_windows(windows, request, max_workers=3)
+    if not segments:
+        raise ValueError("Gemini returned no speech for this video")
+    return _build_result(segments, "gemini_youtube_transcription", language)
+
+
+# ── 3. Download audio and transcribe it ──────────────────────────────────────
+
+
+_AUDIO_MIME_TYPES = {
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".webm": "audio/webm",
+    ".opus": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".mp3": "audio/mp3",
+}
+
+
+def _wait_until_active(client: genai.Client, uploaded, timeout_seconds: int = 300):
+    """Uploaded files must finish processing before they can be used in a prompt."""
+    deadline = time.monotonic() + timeout_seconds
+    while uploaded.state == types.FileState.PROCESSING:
+        if time.monotonic() > deadline:
+            raise ValueError("Gemini took too long to process the uploaded audio.")
+        time.sleep(3)
+        uploaded = client.files.get(name=uploaded.name)
+    if uploaded.state == types.FileState.FAILED:
+        raise ValueError("Gemini could not process the uploaded audio.")
+    return uploaded
+
+
+def _transcribe_from_audio(client: genai.Client, video_id: str, duration_seconds: Optional[float]) -> dict:
+    """Download the audio track with yt-dlp, upload it to Gemini and transcribe it into English."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        audio_template = os.path.join(tmpdir, "audio.%(ext)s")
         ydl_opts = {
             "format": "ba[ext=m4a]/ba/bestaudio",
-            "outtmpl": audio_template,
+            "outtmpl": os.path.join(tmpdir, "audio.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
+            # YouTube needs a JS runtime for full format access; use whichever is installed.
+            "js_runtimes": {"deno": {}, "node": {}},
         }
-
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+                info = ydl.extract_info(video_url, download=True)
         except Exception as e:
-            raise ValueError(f"Failed to download video audio stream: {str(e)}")
+            raise ValueError(f"Failed to download video audio stream: {e}")
 
-        downloaded_files = [
-            f for f in os.listdir(tmpdir)
-            if os.path.isfile(os.path.join(tmpdir, f))
-        ]
+        duration_seconds = duration_seconds or (info or {}).get("duration")
+        downloaded_files = [f for f in os.listdir(tmpdir) if os.path.isfile(os.path.join(tmpdir, f))]
         if not downloaded_files:
             raise ValueError("Failed to extract audio track from video.")
-
         audio_path = os.path.join(tmpdir, downloaded_files[0])
+        mime_type = _AUDIO_MIME_TYPES.get(os.path.splitext(audio_path)[1].lower(), "audio/mp4")
 
-        uploaded_file = None
+        uploaded = client.files.upload(file=audio_path, config=types.UploadFileConfig(mime_type=mime_type))
+
+    try:
+        uploaded = _wait_until_active(client, uploaded)
+
+        def request(start: float, end: Optional[float]) -> str:
+            if end is None:
+                scope = "Transcribe all of the speech in this audio recording of a video."
+            else:
+                scope = (
+                    f"This is the audio of a video. Transcribe ONLY the speech between "
+                    f"{format_timestamp(start)} and {format_timestamp(end)}."
+                )
+            return _generate(client, [uploaded, TRANSCRIBE_PROMPT.format(scope=scope)])
+
+        windows = _plan_windows(duration_seconds, AUDIO_WINDOW_SECONDS)
+        # Sequential: every window request carries the whole file, which adds up fast on rate limits.
+        language, segments = _transcribe_windows(windows, request, max_workers=1)
+        if not segments:
+            raise ValueError("Audio transcription yielded empty text.")
+        return _build_result(segments, "gemini_audio_transcription", language)
+    finally:
         try:
-            # Upload audio file to Gemini Files API
-            uploaded_file = client.files.upload(file=audio_path)
-
-            prompt = (
-                "You are an expert audio transcription system. Transcribe the spoken audio in this file "
-                "with accurate timestamps.\n\n"
-                "Return a JSON array of segment objects in this exact format:\n"
-                "[\n"
-                "  {\"start\": 0.0, \"duration\": 4.5, \"text\": \"spoken text\"},\n"
-                "  {\"start\": 4.5, \"duration\": 5.0, \"text\": \"spoken text\"}\n"
-                "]\n\n"
-                "Rules:\n"
-                "1. Divide the speech into natural sentences or phrases with start time in seconds.\n"
-                "2. Provide accurate, clean transcript text without hallucinations.\n"
-                "3. Output ONLY the JSON array (no extra commentary or explanation)."
-            )
-
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[uploaded_file, prompt],
-            )
-
-            raw_text = response.text.strip()
-            # Clean markdown fences if present
-            if raw_text.startswith("```"):
-                first_nl = raw_text.find("\n")
-                last_fence = raw_text.rfind("```")
-                if last_fence > first_nl:
-                    raw_text = raw_text[first_nl + 1 : last_fence].strip()
-                else:
-                    raw_text = raw_text[first_nl + 1 :].strip()
-
-            segments = []
-            try:
-                parsed = json.loads(raw_text)
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and "text" in item:
-                            start = float(item.get("start", 0))
-                            dur = float(item.get("duration", 0))
-                            segments.append({
-                                "text": str(item["text"]).strip(),
-                                "start": start,
-                                "duration": dur,
-                            })
-            except Exception:
-                # If JSON parsing fails, check if formatted as [MM:SS] text
-                lines = raw_text.splitlines()
-                for line in lines:
-                    line = line.strip()
-                    match = re.match(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.+)$", line)
-                    if match:
-                        ts_str, text_val = match.groups()
-                        start_sec = parse_timestamp_to_seconds(ts_str)
-                        segments.append({
-                            "text": text_val.strip(),
-                            "start": start_sec,
-                            "duration": 5.0,
-                        })
-
-            if not segments:
-                # Fallback: create a single segment from full response text
-                cleaned_text = raw_text.replace("```json", "").replace("```", "").strip()
-                if cleaned_text:
-                    segments = [{
-                        "text": cleaned_text,
-                        "start": 0.0,
-                        "duration": 0.0,
-                    }]
-                else:
-                    raise ValueError("Audio transcription yielded empty text.")
-
-            # Build full timestamped text
-            full_text = ""
-            for seg in segments:
-                ts = format_timestamp(seg["start"])
-                full_text += f"[{ts}] {seg['text']}\n"
-
-            last_seg = segments[-1]
-            duration_seconds = last_seg["start"] + last_seg.get("duration", 0)
-
-            return {
-                "text": full_text,
-                "segments": segments,
-                "duration_seconds": duration_seconds,
-                "source": "gemini_audio_transcription",
-            }
-
-        finally:
-            if uploaded_file and hasattr(uploaded_file, "name"):
-                try:
-                    client.files.delete(name=uploaded_file.name)
-                except Exception:
-                    pass
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
 
 
-def fetch_transcript(video_id: str, on_fallback: Optional[Callable[[], None]] = None) -> dict:
+# ── Public API ───────────────────────────────────────────────────────────────
+
+
+def fetch_transcript(
+    video_id: str,
+    duration_seconds: Optional[float] = None,
+    on_fallback: Optional[Callable[[], None]] = None,
+) -> dict:
     """
-    Fetch transcript for a YouTube video.
-    First tries YouTube captions (manual and auto-generated).
-    If unavailable, automatically falls back to audio download & Gemini transcription.
+    Fetch an English transcript for a YouTube video, whether or not it has captions.
+
+    Args:
+        video_id: YouTube video ID.
+        duration_seconds: Video length if known (from metadata); used to split long
+            videos into windows when transcribing with Gemini.
+        on_fallback: Called before falling back to Gemini transcription.
 
     Returns:
         dict with keys:
-            - 'text': Full transcript as a single string
+            - 'text': Full transcript, one '[MM:SS] text' line per segment
             - 'segments': List of {text, start, duration} segments
-            - 'duration_seconds': Total video duration based on last segment
-            - 'source': 'youtube_captions' or 'gemini_audio_transcription'
+            - 'duration_seconds': Total duration based on last segment
+            - 'source': 'youtube_captions', 'youtube_captions_translated',
+              'gemini_youtube_transcription' or 'gemini_audio_transcription'
+            - 'language': Spoken language of the video, if known
 
     Raises:
-        ValueError: If video ID is invalid or transcription fails
+        ValueError: If video ID is invalid or every method fails
     """
     if not video_id:
         raise ValueError("Invalid video ID")
 
-    # 1. Try YouTube Captions API first (Fast & Free)
+    # 1. YouTube captions (fast and free), translated to English when needed.
     try:
-        return _fetch_from_youtube_api(video_id)
-    except Exception as yt_err:
-        print(f"YouTube captions unavailable for {video_id} ({yt_err}). Falling back to audio transcription...")
+        segments, language_code, language = _fetch_youtube_captions(video_id)
+    except Exception as caption_err:
+        print(f"No usable YouTube captions for {video_id} ({type(caption_err).__name__}). Transcribing with Gemini...")
+    else:
+        if _is_english(language_code):
+            return _build_result(segments, "youtube_captions", language)
+        print(f"Captions for {video_id} are in {language}. Translating to English...")
+        segments, translated = _translate_segments(segments, language)
+        source = "youtube_captions_translated" if translated else "youtube_captions"
+        return _build_result(segments, source, language)
 
-        if on_fallback:
-            try:
-                on_fallback()
-            except Exception:
-                pass
-
-        # 2. Fallback to downloading audio & AI transcription
+    if on_fallback:
         try:
-            return transcribe_audio_fallback(video_id)
-        except Exception as audio_err:
-            raise ValueError(
-                f"Could not retrieve transcript from YouTube captions ({str(yt_err)}) "
-                f"and audio fallback transcription failed: {str(audio_err)}"
-            )
+            on_fallback()
+        except Exception:
+            pass
+
+    # 2 & 3. No captions: have Gemini watch the video, else download the audio.
+    client = _gemini_client()
+    failures = []
+    for label, transcribe in (
+        ("Gemini video transcription", _transcribe_from_youtube_url),
+        ("audio download transcription", _transcribe_from_audio),
+    ):
+        try:
+            return transcribe(client, video_id, duration_seconds)
+        except Exception as e:
+            print(f"{label} failed for {video_id}: {e}")
+            failures.append(f"{label}: {e}")
+
+    raise ValueError(
+        "This video has no captions and it could not be transcribed. " + " | ".join(failures)
+    )
 
 
 def chunk_transcript(
